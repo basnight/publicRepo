@@ -1,0 +1,135 @@
+name: GitLab Pipeline Performance Audit
+
+on:
+  workflow_dispatch: # Allows manual triggering from the GitHub UI
+  #schedule:
+    # Every Friday at 05:00 UTC
+    # This is midnight EST / 12am in America/NewYork
+  # - cron: '0 5 * * 5'
+
+jobs:
+  run-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Only enforce "first Friday" when triggered by schedule.
+      # Manual runs via workflow_dispatch will always proceed.
+      - name: Only continue on first Friday (America/NewYork)
+        if: github.event_name == 'schedule'
+        run: |
+          echo "Checking if this is the first Friday in America/NewYork..."
+
+          # Local date info in America/NewYork
+          local_date=$(TZ=America/NewYork date)
+          day=$(TZ=America/NewYork date +%d)   # 01-31
+          dow=$(TZ=America/NewYork date +%u)   # 1=Mon ... 5=Fri
+
+          echo "Local date/time: $local_date"
+          echo "Day of month: $day"
+          echo "Day of week (1=Mon..7=Sun): $dow"
+
+          # Require Friday (5) AND day-of-month <= 7
+          if [ "$dow" -ne 5 ] || [ "$day" -gt 7 ]; then
+            echo "Not the first Friday in America/NewYork. Exiting workflow early."
+            # Exit successfully so the workflow shows as 'Success' but does nothing else.
+            exit 0
+          fi
+
+          echo "This IS the first Friday in America/NewYork. Continuing with audit."
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run pipeline performance script
+        env:
+          GITLAB_PROJECT_IDS: ${{ secrets.GITLAB_PROJECT_IDS }}
+          GITLAB_ACCESS_TOKEN: ${{ secrets.GITLAB_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Run the script and capture output
+          python python-scripts/gitlab/pipeline-performance-multiple-projects-test.py 2>&1 | tee script.log
+
+          # If the script logged any ERROR lines, treat this step as a failure.
+          # You can tighten/loosen this pattern if needed.
+          if grep -q "ERROR:" script.log; then
+            echo "One or more ERROR lines were detected in script output. Failing step."
+            exit 1
+          fi
+
+      - name: Run pipeline performance with retry script
+        env:
+          GITLAB_PROJECT_IDS: ${{ secrets.GITLAB_PROJECT_IDS }}
+          GITLAB_ACCESS_TOKEN: ${{ secrets.GITLAB_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Run the script and capture output
+          python python-scripts/gitlab/gitlab_pipeline_performance_with_retry.py 2>&1 | tee script_retry.log
+
+          # If the script logged any ERROR lines, treat this step as a failure.
+          if grep -q "ERROR:" script_retry.log; then
+            echo "One or more ERROR lines were detected in script output. Failing step."
+            exit 1
+          fi
+
+      - name: Upload pipeline audit results
+        # This will be skipped if the previous step fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-audit-results
+          path: |
+            pipeline_audit_results_*.zip
+            flakiness_analysis_results_*.zip
+
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: 587
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: 'GitHub Actions Workflow Success: GitLab Pipeline Performance Audit'
+          body: |
+            The GitLab Pipeline Performance Audit workflow completed successfully!
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            You can download the artifact from the workflow run page.
+          to: douglasbasnight@gmail.com
+          from: GitHub Actions <action@github.com>
+
+      - name: Send failure email
+        # This will run iff any previous step in the job failed
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: 587
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: 'GitHub Actions Workflow Failure: GitLab Pipeline Performance Audit'
+          body: |
+            The GitHub Actions GitLab Pipeline Performance Audit workflow failed!
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Please check the workflow run for details.
+          to: ${{ secrets.EMAIL }}
+          from: GitHub Actions <action@github.com>
